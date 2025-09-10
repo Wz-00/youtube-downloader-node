@@ -44,8 +44,16 @@ const limiter = rateLimit({
   message: { status: false, message: 'Too many requests, please try again later.' },
 }); app.use(limiter);
 
+app.use((req, res, next) => {
+  // do not rate-limit job status polling (useful for frontend polling during development)
+  if (req.path.startsWith('/api/job')) {
+    return next();
+  }
+  return limiter(req, res, next);
+});
+
 // Routes
-const route = require('./routes/videoRoute');
+const route = require('./routes/video');
 app.use('/api', route);
 
 // start server
