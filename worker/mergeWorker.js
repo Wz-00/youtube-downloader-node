@@ -59,12 +59,22 @@ function locateYtdlpExecutable() {
 }
 
 // downloadWithYtdlp: try spawning yt-dlp executable; if not available or fails, fallback to youtube-dl-exec npm wrapper
-async function downloadWithYtdlp(formatOrItag, outputPath, url) {
+async function downloadWithYtdlp(formatOrItag, outputPath, url, opts = {}) {
+  // opts: { extractAudio: boolean, audioFormat: 'mp3'|'m4a'|..., quiet: bool }
   const exe = locateYtdlpExecutable();
+  const fmt = String(formatOrItag);
+
+  // Build CLI args for executable path (yt-dlp)
   if (exe) {
     try {
-      console.log('Using yt-dlp executable:', exe, 'to download format:', formatOrItag, '->', outputPath);
-      await runCommand(exe, ['-f', String(formatOrItag), '-o', outputPath, url]);
+      const args = ['-f', fmt, '-o', outputPath];
+      if (opts.extractAudio) {
+        // extract audio via yt-dlp: -x --audio-format <fmt>
+        args.push('-x', '--audio-format', String(opts.audioFormat || 'mp3'));
+      }
+      if (opts.quiet) args.push('-q');
+      console.log('Using yt-dlp executable:', exe, 'args=', args.join(' '));
+      await runCommand(exe, args, { env: process.env });
       return;
     } catch (err) {
       console.warn('yt-dlp executable failed, falling back to youtube-dl-exec:', err.message || err);
@@ -74,18 +84,27 @@ async function downloadWithYtdlp(formatOrItag, outputPath, url) {
     console.log('yt-dlp executable not found in PATH/project; using youtube-dl-exec (npm wrapper)');
   }
 
-  // fallback using youtube-dl-exec (this will use bundled yt-dlp if available)
-  // options: format, output, noWarnings, preferFreeFormats
-  await youtubedlExec(url, {
-    format: String(formatOrItag),
+  // fallback: use youtube-dl-exec (npm)
+  const ytdlOpts = {
     output: outputPath,
+    format: fmt,
     noWarnings: true,
     preferFreeFormats: true,
-    // disable progress streaming to stdout for cleaner logs
-    quiet: true
-  });
+    quiet: !!opts.quiet
+  };
+
+  if (opts.extractAudio) {
+    // youtube-dl-exec uses extractAudio / audioFormat keys
+    ytdlOpts.extractAudio = true;
+    ytdlOpts.audioFormat = opts.audioFormat || 'mp3';
+    // if format was an audio itag, better to just download that audio (use format instead of extract)
+    // but extractAudio will re-encode if necessary
+  }
+
+  await youtubedlExec(url, ytdlOpts);
 }
 
+// MAIN PROCESS PATCH: replace the previous large if/else block with this logic
 mergeQueue.process(MAX_CONCURRENT, async (job) => {
   const { url, itag, filename, output } = job.data;
   console.log(`Processing job ${job.id}: itag=${itag} url=${url}`);
@@ -93,39 +112,107 @@ mergeQueue.process(MAX_CONCURRENT, async (job) => {
   try {
     if (job && typeof job.progress === 'function') job.progress(5);
 
-    // fetch metadata
     const info = await getInfo(url);
     if (job && typeof job.progress === 'function') job.progress(10);
 
-    // find format metadata
     const format = (info.formats || []).find(f => String(f.format_id || f.itag) === String(itag));
     if (!format) throw new Error('Format not found in metadata');
 
-    // prepare filenames (unique)
     const safeName = (filename || info.title || `video_${Date.now()}`).replace(/[^\w\-_. ]+/g, '_').substring(0,200);
     const outExt = output || (format.ext || 'mp4');
     const uniqueSuffix = `${job.id}-${Date.now()}`;
     const outBasename = `${safeName}-${uniqueSuffix}.${outExt}`;
     const outPath = path.join(TEMP_DIR, outBasename);
 
-    // temp files for video/audio
-    const videoTmp = path.join(TEMP_DIR, `${safeName}-${uniqueSuffix}.video.${format.ext || 'mp4'}`);
-    const audioTmp = path.join(TEMP_DIR, `${safeName}-${uniqueSuffix}.audio.m4a`);
+    const audioOutputs = new Set(['mp3','m4a','aac','wav','opus']);
+    const wantAudioOnly = audioOutputs.has(String(outExt).toLowerCase());
 
     const hasAudioInFormat = format.acodec && String(format.acodec) !== 'none';
     const hasVideoInFormat = format.vcodec && String(format.vcodec) !== 'none';
 
-    // If format is muxed (contains both audio & video), download directly to outPath
+    // CASE 1: muxed (contains audio + video) => download as-is
     if (hasAudioInFormat && hasVideoInFormat && format.url) {
       if (job && typeof job.progress === 'function') job.progress(20);
       console.log('Downloading muxed format to', outPath);
-      await downloadWithYtdlp(itag, outPath, url);
+      await downloadWithYtdlp(itag, outPath, url, { quiet: true });
       if (job && typeof job.progress === 'function') job.progress(60);
-    } else {
-      // video-only: download video stream then download best audio, then merge locally
+    } else if (hasAudioInFormat && !hasVideoInFormat) {
+      if (wantAudioOnly) {
+        // download audio directly (no merge)
+        if (job && typeof job.progress === 'function') job.progress(20);
+        console.log('Downloading audio-only format to', outPath, 'format-itag=', itag);
+        await downloadWithYtdlp(itag, outPath, url, { extractAudio: true, audioFormat: outExt, quiet: true });
+        if (job && typeof job.progress === 'function') job.progress(80);
+      } else {
+        // Defensive fallback: try to find a video format matching requested resolution (if any)
+        const tryDesiredHeight = (() => {
+          const m = String(outExt).match(/^(\d+)p$/); // not likely; adjust if you send resolution separately
+          return m ? Number(m[1]) : null;
+        })();
+
+        // first try to find any video with same itag? better: find best mp4 video
+        const mp4Videos = (info.formats || []).filter(f => f.vcodec && String(f.vcodec) !== 'none' && (f.ext || f.container || '').toLowerCase() === 'mp4');
+        // attempt to pick nearest quality (prefer >= desired)
+        let candidateVideo = null;
+        if (tryDesiredHeight && mp4Videos.length) {
+          mp4Videos.sort((a,b) => (a.height||0) - (b.height||0));
+          candidateVideo = mp4Videos.find(v => v.height === tryDesiredHeight) || mp4Videos.find(v => v.height && v.height >= tryDesiredHeight) || mp4Videos.slice().sort((a,b)=> (b.height||0)-(a.height||0))[0];
+        } else if (mp4Videos.length) {
+          candidateVideo = mp4Videos.slice().sort((a,b)=> (b.height||0)-(a.height||0))[0];
+        }
+
+        if (candidateVideo) {
+          console.warn('Selected format was audio-only but user requested video output; falling back to video itag=', candidateVideo.format_id || candidateVideo.itag);
+          // replace format & continue processing route as video-only branch
+          // WARNING: careful to avoid infinite recursion; do inline: download video then audio and merge
+          const videoFmtId = candidateVideo.format_id || candidateVideo.itag;
+          const videoTmp = path.join(TEMP_DIR, `${safeName}-${uniqueSuffix}.video.${candidateVideo.ext || 'mp4'}`);
+          const audioTmp = path.join(TEMP_DIR, `${safeName}-${uniqueSuffix}.audio.m4a`);
+
+          console.log('Downloading fallback video stream to', videoTmp);
+          await downloadWithYtdlp(videoFmtId, videoTmp, url, { quiet: true });
+
+          const audios = (info.formats || []).filter(f => f.acodec && String(f.acodec) !== 'none' && (f.format_id || f.itag));
+          audios.sort((a,b) => (b.abr || b.audioBitrate || 0) - (a.abr || a.audioBitrate || 0));
+          if (!audios.length) throw new Error('No audio stream available to merge (fallback)');
+          const audioFormatId = audios[0].format_id || audios[0].itag;
+          console.log('Downloading audio stream to', audioTmp, 'formatId=', audioFormatId);
+          await downloadWithYtdlp(audioFormatId, audioTmp, url, { quiet: true });
+          if (job && typeof job.progress === 'function') job.progress(50);
+
+          const ffmpegArgs = [
+            '-y', '-hide_banner', '-loglevel', 'error',
+            '-i', videoTmp,
+            '-i', audioTmp,
+            '-map', '0:v:0',
+            '-map', '1:a:0',
+            '-c:v', 'copy',
+            '-c:a', 'aac',
+            '-b:a', '192k',
+            '-movflags', '+faststart',
+            '-f', outExt,
+            outPath
+          ];
+          console.log('Merging via ffmpeg ->', outPath);
+          await runCommand('ffmpeg', ffmpegArgs);
+          if (job && typeof job.progress === 'function') job.progress(80);
+
+          // cleanup
+          try { if (await fs.pathExists(videoTmp)) await fs.remove(videoTmp); } catch(e){ console.warn('cleanup videoTmp', e); }
+          try { if (await fs.pathExists(audioTmp)) await fs.remove(audioTmp); } catch(e){ console.warn('cleanup audioTmp', e); }
+        } else {
+          // no fallback -> explicit clear error
+          throw new Error('Selected format contains only audio but requested video output');
+        }
+      }
+    } else if (!hasAudioInFormat && hasVideoInFormat) {
+      // CASE 3: video-only -> need to download video then pick best audio and merge
       if (job && typeof job.progress === 'function') job.progress(20);
+      const videoTmp = path.join(TEMP_DIR, `${safeName}-${uniqueSuffix}.video.${format.ext || 'mp4'}`);
+      const audioTmp = path.join(TEMP_DIR, `${safeName}-${uniqueSuffix}.audio.m4a`);
+
       console.log('Downloading video-only stream to', videoTmp);
-      await downloadWithYtdlp(itag, videoTmp, url);
+      await downloadWithYtdlp(itag, videoTmp, url, { quiet: true });
 
       // pick best audio from metadata
       const audios = (info.formats || []).filter(f => f.acodec && String(f.acodec) !== 'none' && (f.format_id || f.itag));
@@ -133,7 +220,7 @@ mergeQueue.process(MAX_CONCURRENT, async (job) => {
       if (!audios.length) throw new Error('No audio stream available to merge');
       const audioFormatId = audios[0].format_id || audios[0].itag;
       console.log('Downloading audio stream to', audioTmp, 'formatId=', audioFormatId);
-      await downloadWithYtdlp(audioFormatId, audioTmp, url);
+      await downloadWithYtdlp(audioFormatId, audioTmp, url, { quiet: true });
       if (job && typeof job.progress === 'function') job.progress(50);
 
       // merge via ffmpeg from local files (copy video stream)
@@ -158,29 +245,29 @@ mergeQueue.process(MAX_CONCURRENT, async (job) => {
       // cleanup video/audio tmp files
       try { if (await fs.pathExists(videoTmp)) await fs.remove(videoTmp); } catch(e){ console.warn('cleanup videoTmp', e); }
       try { if (await fs.pathExists(audioTmp)) await fs.remove(audioTmp); } catch(e){ console.warn('cleanup audioTmp', e); }
+
+    } else {
+      throw new Error('Unknown stream type (no audio & no video)');
     }
 
-    // Upload or move result (storage module decides S3 vs local)
+    // upload result (same as before)
     const key = `merged/${path.basename(outPath)}`;
     console.log('Uploading', outPath, '->', key);
     if (job && typeof job.progress === 'function') job.progress(85);
     const downloadUrl = await uploadFile(outPath, key);
     if (job && typeof job.progress === 'function') job.progress(100);
 
-    // save result in Redis for quick retrieval by API
     const resultKey = `jobResult:${job.id}`;
     await redisClient.set(resultKey, JSON.stringify({ downloadUrl, key }), 'EX', Number(process.env.JOB_RESULT_TTL || 86400));
-
-    // cleanup outPath if still exists (uploadFile may have moved it)
     try { if (await fs.pathExists(outPath)) await fs.remove(outPath); } catch(e){ console.warn('cleanup outPath', e); }
 
     return { downloadUrl, key };
   } catch (err) {
     console.error(`Job ${job.id} failed:`, err);
-    // rethrow so Bull marks job as failed
     throw err;
   }
 });
+
 
 mergeQueue.on('completed', (job, result) => {
   console.log('Job completed', job.id);
