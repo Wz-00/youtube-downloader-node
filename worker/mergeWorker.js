@@ -8,6 +8,7 @@ const Redis = require('ioredis');
 const youtubedlExec = require('youtube-dl-exec'); // fallback npm wrapper
 const { getInfo } = require('../app/services/ytdlService');
 const { uploadFile } = require('../app/services/storage');
+const { Videos } = require('../app/models');
 
 const redisUrl = process.env.REDIS_URL || 'redis://127.0.0.1:6379';
 const queueName = 'mergeQueue';
@@ -130,6 +131,7 @@ mergeQueue.process(MAX_CONCURRENT, async (job) => {
     const hasAudioInFormat = format.acodec && String(format.acodec) !== 'none';
     const hasVideoInFormat = format.vcodec && String(format.vcodec) !== 'none';
 
+    
     // CASE 1: muxed (contains audio + video) => download as-is
     if (hasAudioInFormat && hasVideoInFormat && format.url) {
       if (job && typeof job.progress === 'function') job.progress(20);
@@ -256,6 +258,50 @@ mergeQueue.process(MAX_CONCURRENT, async (job) => {
     if (job && typeof job.progress === 'function') job.progress(85);
     const downloadUrl = await uploadFile(outPath, key);
     if (job && typeof job.progress === 'function') job.progress(100);
+
+    let filesizeStr = null;
+    try {
+      // jika outPath masih ada local (uploadFile mungkin memindah/meng-copy) -> stat
+      if (await fs.pathExists(outPath)) {
+        const st = await fs.stat(outPath);
+        filesizeStr = `${(st.size / (1024 * 1024)).toFixed(2)} MB`;
+      } else {
+        // jika file sudah tidak ada lokal (upload moved it), attempt to get size via upload response if available
+        // uploadFile should ideally return size or you can skip; fallback to null
+        filesizeStr = null;
+      }
+    } catch (e) {
+      console.warn('stat failed for outPath:', e);
+      filesizeStr = null;
+    }
+
+    // --- determine final filename & resolution & format ---
+    const finalFilename = path.basename(outPath);
+    const finalExt = outExt || (format && format.ext) || (String(output || '').toLowerCase()) || path.extname(finalFilename).replace('.', '');
+    let finalResolution = null; // compute if we can
+    // prefer format.height if available (note: ensure `format` variable still in scope)
+    if (format && format.height) finalResolution = `${format.height}p`;
+    // else if requested resolution given in job.data.requestedResolution, use that as fallback
+    if (!finalResolution && job.data && job.data.requestedResolution) {
+      finalResolution = (typeof job.data.requestedResolution === 'string' && /^\d+$/.test(job.data.requestedResolution))
+        ? `${job.data.requestedResolution}p`
+        : job.data.requestedResolution;
+    }
+
+    // Now create the DB record (only after success)
+    try {
+      await Videos.create({
+        iplog: job.data?.iplog || null,
+        url: job.data?.url || url,
+        resolution: finalResolution || 'unknown',
+        format: finalExt || 'mp4',
+        filename: finalFilename,
+        filesize: filesizeStr || 'unknown'
+      });
+      console.log('Videos record created for job', job.id);
+    } catch (dbErr) {
+      console.error('Failed to create Videos record:', dbErr);
+    }
 
     const resultKey = `jobResult:${job.id}`;
     await redisClient.set(resultKey, JSON.stringify({ downloadUrl, key }), 'EX', Number(process.env.JOB_RESULT_TTL || 86400));
